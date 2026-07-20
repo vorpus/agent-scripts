@@ -35,6 +35,18 @@ twitter status                     # auth check — "ok: true" when good
 
 `-c` is compact/LLM-friendly output. Use it by default.
 
+### How many tweets
+
+**Always pass `-n` explicitly.** Omitting it fetches **50** — `-n` defaults to
+`None` at the CLI layer and resolves downstream to `config.fetch.count`, which
+falls back to 50 (`cli.py:194`). The `-n 20` in the examples above is just an
+example value, not the tool's default.
+
+50 is more than most requests need, and volume is the thing to keep low here
+(see Notes). Pick a count that fits the ask rather than inheriting the fallback.
+A `fetch.count` key in the twitter-cli config changes the fallback if you'd
+rather not repeat `-n`.
+
 ## Notes
 
 - **`search` is unreliable** in 0.8.5 (observed HTTP 503). X changes GraphQL
