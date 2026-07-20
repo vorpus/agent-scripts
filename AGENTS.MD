@@ -26,3 +26,11 @@ symlinked repo. Check where they write before running them, especially if they
 Commit and push skill changes in the same session you make them — don't leave
 them staged or local. The repo is the canonical copy and is **public**, so check
 for credentials before pushing.
+
+## Dashboard changes
+
+Changes to the beemo-dashboard (anything under `~/homelab/beemo-dashboard`)
+should always be committed and pushed up to `main` in the same session — don't
+leave them local or on a branch. SSH pushes fail in this environment; push over
+HTTPS using the `gh` token (`git -c credential.helper='!gh auth git-credential'
+push …`) or land the branch with `gh pr merge`.
