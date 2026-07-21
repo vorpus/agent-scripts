@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Scaffold a new project: folder in ~/projects, git init, GitHub repo, README.
+# Scaffold a new project: folder in ~/projects, git init, GitHub repo, README,
+# AGENTS.md + CLAUDE.md (from this skill's templates), and a docs/ folder.
 #
 # Usage: new-project.sh <name> [description] [--public] [--local]
 #   --public   create the GitHub repo public (default: private)
-#   --local    skip GitHub entirely (folder + git + README only)
+#   --local    skip GitHub entirely (folder + git + files only)
 #
 # Base dir is ~/projects, override with PROJECTS_DIR. Pushes over HTTPS using
 # the gh credential helper (SSH pushes fail in this environment).
 set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+templates="$script_dir/../templates"
 
 name=""
 description=""
@@ -50,13 +54,22 @@ mkdir -p "$target"
 cd "$target"
 git -c init.defaultBranch=main init -q
 
+# README stub
 if [ -n "$description" ]; then
   printf '# %s\n\n%s\n' "$name" "$description" > README.md
 else
   printf '# %s\n\n_One line on what this is and why you would want it._\n' "$name" > README.md
 fi
 
-git add README.md
+# AGENTS.md + CLAUDE.md from templates, with the project name filled in
+sed "s/{{PROJECT}}/$name/g" "$templates/AGENTS.md" > AGENTS.md
+cp "$templates/CLAUDE.md" CLAUDE.md
+
+# docs/ for all Markdown (PRDs, research, milestones, work logs)
+mkdir -p docs
+touch docs/.gitkeep
+
+git add README.md AGENTS.md CLAUDE.md docs/.gitkeep
 git -c commit.gpgsign=false commit -qm "Initial commit"
 
 if [ "$remote" -eq 0 ]; then
