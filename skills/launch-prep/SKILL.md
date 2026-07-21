@@ -39,6 +39,31 @@ then a fast quickstart. Flag it if:
 Report concrete fixes. The bar is "a stranger gets it in 10 seconds," not
 completeness.
 
+### Machine-local references (any repo)
+
+Run on any repo before it goes public or gets a contributor:
+
+```bash
+python3 skills/launch-prep/scripts/local-refs.py [repo-path]
+```
+
+Flags references that only make sense on this machine:
+
+- **HIGH** — absolute home paths (`/Users/you`, `/home/you`), your username. These
+  are broken on anyone else's machine; strip them or make them relative/configurable.
+- **MED** — `~/projects`, `~/.claude|.codex/skills`, the `agent-scripts` pointer,
+  personal config dirs. Won't error but will confuse a contributor.
+- **INFO** — `localhost`/loopback, email addresses. Usually fine; review in context.
+
+Exits 1 if any HIGH finding, so it doubles as a pre-ship gate. It scans
+git-tracked files (falling back to a tree walk) and detects your home/username at
+runtime, so it's not hardcoded to one machine. Report findings and offer to fix;
+don't rewrite paths unattended.
+
+> Note: projects scaffolded by `new-project` carry `~/projects/agent-scripts/AGENTS.MD`
+> in AGENTS.md — this will show up as MED. It's `(skip if missing)` so it degrades
+> gracefully, but decide whether to keep it before open-sourcing.
+
 ## 2. Generate
 
 Always produce both. These are drafts for the user to pick from — generate, show,
