@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""imagegen — generate images with a ChatGPT subscription via the Codex backend.
+
+Minimal single-file, stdlib-only CLI. POSTs to chatgpt.com's codex/responses
+endpoint with the `image_generation` tool, reusing the OAuth token that
+`codex login` (the official Codex CLI) writes to ~/.codex/auth.json.
+Auto-refreshes an expired access token once and persists it back.
+
+Every call bills the metered Codex-usage bucket of the ChatGPT plan.
+
+Adapted (heavily trimmed) from https://github.com/leeguooooo/chatgpt-imagegen
+(MIT). This version deliberately drops the web-browser backend, style gallery,
+update checks, and animation support: no network calls except chatgpt.com and
+auth.openai.com.
+
+Usage:
+    imagegen "a watercolor cat" -o cat.png --size 1024x1024
+    imagegen "make it night" --ref photo.jpg -o night.png   # image-to-image
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any, Iterator
+
+BACKEND = "https://chatgpt.com/backend-api/codex/responses"
+OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI's published client id
+AUTH_PATH = Path.home() / ".codex" / "auth.json"
+VERSION_PATH = Path.home() / ".codex" / "version.json"
+# Never send a `version` header older than this floor: the backend rejects new
+# models for old client versions, and ~/.codex/version.json can lag.
+VERSION_FLOOR = "0.147.0"
+REF_B64_MAX = 5 * 1024 * 1024  # request-body budget per reference image
+REF_URL_DOWNLOAD_MAX = 25 * 1024 * 1024
+
+
+class BackendError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+# ---------- auth ----------
+
+def load_auth() -> tuple[dict, str, str | None, str | None]:
+    """Return (auth_doc, access_token, account_id, refresh_token)."""
+    try:
+        auth = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        sys.exit("~/.codex/auth.json not found — run `codex login` first.")
+    except Exception as e:
+        sys.exit(f"failed to parse {AUTH_PATH}: {e}")
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict) or not isinstance(tokens.get("access_token"), str):
+        sys.exit("no OAuth access_token in ~/.codex/auth.json — run `codex login`. "
+                 "(An OPENAI_API_KEY there is not a substitute.)")
+    account = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else None
+    refresh = tokens.get("refresh_token") if isinstance(tokens.get("refresh_token"), str) else None
+    return auth, tokens["access_token"], account, refresh
+
+
+def refresh_access_token(refresh_token: str) -> dict:
+    data = urllib.parse.urlencode({
+        "client_id": OAUTH_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": "openid profile email",
+    }).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL, data=data, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # Never surface the response body — it may carry token material.
+        sys.exit(f"token refresh failed (HTTP {e.code}) — run `codex login` again.")
+    except Exception as e:
+        sys.exit(f"token refresh failed: {type(e).__name__}")
+
+
+def persist_refreshed(auth: dict, refreshed: dict) -> None:
+    """Atomically write refreshed tokens back to auth.json, mode 0600."""
+    tokens = auth.setdefault("tokens", {})
+    for key in ("access_token", "refresh_token", "id_token"):
+        if isinstance(refreshed.get(key), str):
+            tokens[key] = refreshed[key]
+    auth["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fd, tmp = tempfile.mkstemp(prefix=".auth.", suffix=".tmp", dir=str(AUTH_PATH.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(auth, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, AUTH_PATH)
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def client_version() -> str:
+    """Newer of ~/.codex/version.json's latest_version and VERSION_FLOOR."""
+    def parse(v: str) -> tuple[int, ...] | None:
+        return tuple(int(p) for p in v.split(".")) if re.fullmatch(r"\d+(\.\d+)*", v) else None
+    try:
+        v = json.loads(VERSION_PATH.read_text()).get("latest_version")
+        pv, pf = parse(v or ""), parse(VERSION_FLOOR)
+        if pv and pf and pv >= pf:
+            return v
+    except Exception:
+        pass
+    return VERSION_FLOOR
+
+
+def build_headers(token: str, account_id: str | None, version: str) -> dict[str, str]:
+    sid = str(uuid.uuid4())
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+        "version": version,
+        "session_id": sid,
+        "x-client-request-id": sid,
+        "User-Agent": f"codex_cli_rs/{version} (Mac OS 26.0.1; arm64) imagegen",
+        "originator": "codex_cli_rs",
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    return headers
+
+
+# ---------- reference images (image-to-image) ----------
+
+def sniff_mime(data: bytes) -> str | None:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def load_reference(ref: str) -> tuple[str, str]:
+    """(base64, mime) for a local path or http(s) URL."""
+    if ref.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(ref, headers={"User-Agent": "imagegen/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                raw = r.read(REF_URL_DOWNLOAD_MAX + 1)
+        except Exception as e:
+            sys.exit(f"could not download reference {ref!r}: {e}")
+        if len(raw) > REF_URL_DOWNLOAD_MAX:
+            sys.exit(f"reference {ref!r} exceeds the "
+                     f"{REF_URL_DOWNLOAD_MAX // 2**20} MB download cap")
+    else:
+        p = Path(ref).expanduser()
+        if not p.is_file():
+            sys.exit(f"reference image not found: {ref}")
+        raw = p.read_bytes()
+    mime = sniff_mime(raw)
+    if mime is None:
+        sys.exit(f"unsupported reference type for {ref!r} (need PNG, JPEG, or WEBP)")
+    b64 = base64.b64encode(raw).decode("ascii")
+    if len(b64) > REF_B64_MAX:
+        sys.exit(f"reference {ref!r} is too large (>{REF_B64_MAX // 2**20} MB "
+                 f"base64) — downsize it first (e.g. `sips -Z 2048 img.png`)")
+    return b64, mime
+
+
+# ---------- request ----------
+
+def build_payload(prompt: str, size: str, fmt: str, model: str,
+                  refs: list[tuple[str, str]]) -> dict:
+    if refs:
+        text = ("Use the image_generation tool to edit the attached reference "
+                "image(s). Treat the reference as the canonical subject — "
+                "reproduce its pattern, colours, and texture faithfully. "
+                f"Request: {prompt}. Output format: {fmt}.")
+    else:
+        text = ("Use the image_generation tool to render the following. "
+                f"Request: {prompt}. Output format: {fmt}.")
+    if size and size != "auto":
+        text += f" Size: {size}."
+    text += " Do not include explanatory text — produce only the image."
+
+    tool: dict[str, Any] = {"type": "image_generation", "output_format": fmt}
+    if size and size != "auto":
+        tool["size"] = size
+    content: list[dict] = [
+        {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"}
+        for b64, mime in refs
+    ]
+    content.append({"type": "input_text", "text": text})
+
+    # `instructions` must match a backend-allowlisted prompt; this one is known
+    # to be accepted for image generation on gpt-5.5.
+    return {
+        "model": model,
+        "stream": True,
+        "instructions": "You are an image generation assistant.",
+        "input": [{"type": "message", "role": "user", "content": content}],
+        "tools": [tool],
+        "tool_choice": "required" if refs else "auto",
+        "parallel_tool_calls": False,
+        "store": False,
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "include": ["reasoning.encrypted_content"],
+        "text": {"verbosity": "low"},
+    }
+
+
+def sse_events(headers: dict, body: dict, deadline: float,
+               stall_timeout: float) -> Iterator[dict]:
+    """POST and yield parsed JSON events from the SSE stream."""
+    req = urllib.request.Request(BACKEND, data=json.dumps(body).encode(),
+                                 headers=headers, method="POST")
+    connect = max(1.0, min(30.0, deadline - time.monotonic()))
+    resp = urllib.request.urlopen(req, timeout=connect)
+    # urllib leaves the connect timeout on the socket as the per-read timeout;
+    # a quiet gap while the image renders routinely exceeds it, so loosen the
+    # per-read window to stall_timeout (the deadline still bounds the total).
+    try:
+        resp.fp.raw._sock.settimeout(  # type: ignore[attr-defined]
+            min(stall_timeout, max(1.0, deadline - time.monotonic())))
+    except Exception:
+        pass
+    try:
+        buf: list[str] = []
+        for raw in resp:
+            if time.monotonic() >= deadline:
+                raise BackendError("stream exceeded the total --timeout budget")
+            line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+            if line == "":
+                if buf:
+                    payload = "\n".join(buf)
+                    buf = []
+                    if payload == "[DONE]":
+                        return
+                    try:
+                        yield json.loads(payload)
+                    except Exception:
+                        pass
+            elif line.startswith("data:"):
+                buf.append(line[5:].lstrip(" "))
+    finally:
+        resp.close()
+
+
+def generate(payload: dict, headers: dict, deadline: float, stall_timeout: float,
+             emit) -> bytes:
+    """Run one generation; return image bytes. Raises BackendError."""
+    image_b64: str | None = None
+    failure: str | None = None
+    seen: set[str] = set()
+    try:
+        for evt in sse_events(headers, payload, deadline, stall_timeout):
+            t = evt.get("type", "?")
+            if t not in seen:
+                seen.add(t)
+                phase = {"response.image_generation_call.in_progress": "queued",
+                         "response.image_generation_call.generating": "generating",
+                         "response.image_generation_call.partial_image": "receiving image",
+                         }.get(t)
+                if phase:
+                    emit(phase)
+            if t in ("error", "response.failed"):
+                err = (evt.get("response") or {}).get("error") if isinstance(
+                    evt.get("response"), dict) else None
+                if isinstance(err, dict):
+                    failure = err.get("message") or err.get("code")
+                failure = failure or evt.get("message") or evt.get("code")
+            if t == "response.output_item.done":
+                item = evt.get("item")
+                if (isinstance(item, dict)
+                        and item.get("type") == "image_generation_call"
+                        and isinstance(item.get("result"), str)):
+                    image_b64 = item["result"]
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")[:600]
+        raise BackendError(f"HTTP {e.code}: {detail}", status=e.code) from None
+    except (TimeoutError, ConnectionError):
+        raise BackendError(
+            "stalled: no data from the backend within the stall window — "
+            "retry, or raise --stall-timeout / --timeout") from None
+    except urllib.error.URLError as e:
+        raise BackendError(f"network error: {e.reason}") from None
+
+    if not image_b64:
+        raise BackendError(failure and f"backend failed: {failure}"
+                           or f"no image returned (events: {', '.join(sorted(seen)) or 'none'})")
+    try:
+        return base64.b64decode(image_b64, validate=True)
+    except Exception:
+        raise BackendError("backend returned invalid base64 image data") from None
+
+
+# ---------- output ----------
+
+def default_out_path(prompt: str, fmt: str) -> Path:
+    slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40] or "image"
+    ext = "jpg" if fmt == "jpeg" else fmt
+    path = Path(f"{slug}.{ext}")
+    n = 2
+    while path.exists():
+        path = Path(f"{slug}-{n}.{ext}")
+        n += 1
+    return path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Generate an image with a ChatGPT subscription "
+                    "(Codex backend; bills the metered Codex-usage bucket).")
+    ap.add_argument("prompt")
+    ap.add_argument("-o", "--out", metavar="PATH",
+                    help="output file (default: <prompt-slug>.<ext>, auto-numbered; "
+                         "with -o an existing file is overwritten)")
+    ap.add_argument("--size", default="auto",
+                    help="auto | WIDTHxHEIGHT (1024x1024, 1536x1024, 1024x1536)")
+    ap.add_argument("--format", default="png", choices=["png", "jpeg", "webp"])
+    ap.add_argument("--model", default=os.environ.get("IMAGEGEN_MODEL", "gpt-5.5"))
+    ap.add_argument("-i", "--ref", action="append", default=[], metavar="IMG",
+                    help="reference image (path or URL) for image-to-image; repeatable")
+    ap.add_argument("--timeout", type=float, default=300,
+                    help="total budget in seconds (default 300)")
+    ap.add_argument("--stall-timeout", type=float, default=120,
+                    help="max seconds of backend silence before aborting (default 120)")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="no progress on stderr (stdout is always just the path)")
+    args = ap.parse_args()
+
+    start = time.monotonic()
+
+    def emit(msg: str) -> None:
+        if not args.quiet:
+            print(f"[{time.monotonic() - start:6.1f}s] {msg}", file=sys.stderr)
+
+    auth, access, account_id, refresh = load_auth()
+    refs = [load_reference(r) for r in args.ref]
+    payload = build_payload(args.prompt, args.size, args.format, args.model, refs)
+    version = client_version()
+    deadline = time.monotonic() + args.timeout
+    stall = min(args.stall_timeout, args.timeout)
+
+    emit(f"model {args.model}, size {args.size}, format {args.format}"
+         + (f", {len(refs)} reference(s)" if refs else ""))
+    try:
+        image = generate(payload, build_headers(access, account_id, version),
+                         deadline, stall, emit)
+    except BackendError as e:
+        if e.status not in (401, 403) or not refresh:
+            sys.exit(str(e))
+        emit("access token expired; refreshing")
+        refreshed = refresh_access_token(refresh)
+        new_access = refreshed.get("access_token")
+        if not isinstance(new_access, str) or not new_access:
+            sys.exit("refresh response missing access_token — run `codex login` again")
+        try:
+            persist_refreshed(auth, refreshed)
+        except Exception as p_err:
+            print(f"warning: could not persist refreshed token: "
+                  f"{type(p_err).__name__}", file=sys.stderr)
+        try:
+            image = generate(payload, build_headers(new_access, account_id, version),
+                             deadline, stall, emit)
+        except BackendError as retry_err:
+            sys.exit(str(retry_err))
+
+    out = Path(args.out).expanduser() if args.out else default_out_path(
+        args.prompt, args.format)
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(image)
+    emit(f"saved {out} ({len(image):,} bytes)")
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
