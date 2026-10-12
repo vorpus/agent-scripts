@@ -6,8 +6,10 @@
 #   --public   create the GitHub repo public (default: private)
 #   --local    skip GitHub entirely (folder + git + files only)
 #
-# Base dir is ~/projects, override with PROJECTS_DIR. Pushes over HTTPS using
-# the gh credential helper (SSH pushes fail in this environment).
+# Base dir is /Volumes/offload/projects (the internal SSD is chronically full),
+# falling back to ~/projects only if that volume isn't mounted. Override with
+# PROJECTS_DIR. Pushes over HTTPS using the gh credential helper (SSH pushes
+# fail in this environment).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +40,14 @@ if ! printf '%s' "$name" | grep -qE '^[A-Za-z0-9._-]+$'; then
   exit 2
 fi
 
-base="${PROJECTS_DIR:-$HOME/projects}"
+if [ -n "${PROJECTS_DIR:-}" ]; then
+  base="$PROJECTS_DIR"
+elif [ -d /Volumes/offload/projects ]; then
+  base=/Volumes/offload/projects
+else
+  echo "warning: /Volumes/offload not mounted — using ~/projects (internal SSD)" >&2
+  base="$HOME/projects"
+fi
 target="$base/$name"
 if [ -e "$target" ]; then
   echo "already exists: $target" >&2

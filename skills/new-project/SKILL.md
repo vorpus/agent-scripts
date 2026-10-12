@@ -5,7 +5,7 @@ description: "Scaffold a new project — folder, git, GitHub repo, README, agent
 
 # New Project
 
-Start a fresh project. Creates a folder in `~/projects`, `git init`s it on `main`,
+Start a fresh project. Creates a folder in `/Volumes/offload/projects`, `git init`s it on `main`,
 makes a matching GitHub repo, and commits a starter scaffold:
 
 - `README.md` — stub (fill in / run `launch-prep` later).
@@ -41,8 +41,10 @@ future projects start with. What they currently encode:
 
 ## Notes
 
-- Base dir is `~/projects`, overridable with `PROJECTS_DIR`. It is **not** the
-  session's current directory — the script always targets `~/projects` so it
+- Base dir is `/Volumes/offload/projects` (external drive — the internal SSD is
+  chronically full). Falls back to `~/projects` with a warning if offload isn't
+  mounted; override with `PROJECTS_DIR`. It is **not** the session's current
+  directory — the script always targets the base dir so it
   works the same called from any session.
 - Pushes over HTTPS via the gh credential helper; SSH pushes fail in this
   environment.
