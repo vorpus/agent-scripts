@@ -25,9 +25,27 @@ Rules:
 - Prefer helper scripts under `skills/<name>/scripts/` when a workflow has repeatable commands.
 - Quote `description` in front matter.
 
-Global discovery usually points here:
+Both agents discover the same shared folder through symlinks:
+
 - `~/.claude/skills -> ~/projects/agent-scripts/skills`
-- `~/.codex/skills -> ~/projects/agent-scripts/skills`
+- `~/.agents/skills -> ~/projects/agent-scripts/skills` (Codex)
+
+After cloning this repo to `~/projects/agent-scripts`, set up both links:
+
+```bash
+mkdir -p "$HOME/.claude" "$HOME/.agents"
+ln -s "$HOME/projects/agent-scripts/skills" "$HOME/.claude/skills"
+ln -s "$HOME/projects/agent-scripts/skills" "$HOME/.agents/skills"
+```
+
+Skip any link that already points to this repo. If a destination is an existing
+directory or a different symlink, move it to a backup first; don't run `ln -s`
+against an existing directory, which creates a nested link instead.
+
+Codex's [user skill location](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
+is `~/.agents/skills`. Leave `~/.codex/skills/.system` in place for its bundled
+skills. Edits and new skills in this repo are shared by both agents immediately.
+If a skill doesn't appear in Codex, restart Codex to refresh discovery.
 
 Shared personal skills live as real folders in `skills/`. Repo-owned skills stay canonical in their own repo and are exposed here via tracked relative symlinks, for example:
 
