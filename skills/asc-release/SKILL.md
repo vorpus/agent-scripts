@@ -1,6 +1,6 @@
 ---
 name: asc-release
-description: "App Store Connect release operations: metadata, screenshots, build attach, submit for review."
+description: "Send to TestFlight; App Store Connect release operations: metadata, screenshots, build attach, submit for review."
 ---
 
 # ASC release operations
@@ -27,6 +27,31 @@ prompt, or log.
 
 Toolkit venv: `~/projects/app-store-release-agent/.venv` (create with
 `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
+
+## "Send to TestFlight" (default flow)
+
+When the operator says "send to TestFlight" (or "push to TestFlight", "ship a
+TestFlight build"), do all of this without asking for each step:
+
+1. Build and upload with the app repo's own tooling (e.g. `Tools/testflight.sh all`,
+   or the repo's `docs/RELEASE.md`). Bump the build number if the repo doesn't.
+2. If the bundle id has no App Store Connect record yet, stop and ask the
+   operator to create it (the API can't create app records); then continue.
+3. Ensure the internal tester group, with `--apply` straight away. The
+   operator has pre-authorized this; it is idempotent:
+
+   ```
+   .venv/bin/python ~/.claude/skills/asc-release/scripts/tf_internal_group.py --bundle-id <id> --apply
+   ```
+
+   It creates the internal group `me` (all builds, no beta review) if missing
+   and adds `$ASC_TESTER_EMAIL` (set in `env.sh`). Because the group gets all
+   builds, nothing else is needed for the new build to reach the operator.
+4. Prepend a changelog entry in `$ASC_WORKSPACE_DIR/<slug>/changelog.md`,
+   creating the slug folder (`name.txt`, `bundle-id.txt`, `app-id.txt`,
+   `in-flight-version.txt`) for a new app.
+
+External groups, public links and beta review stay opt-in. Ask first.
 
 ## Commands
 
